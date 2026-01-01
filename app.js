@@ -6,13 +6,19 @@ const path = require('path');
 
 const app = express();
 
-// إعداد قاعدة البيانات (تلقائياً تختار PostgreSQL عند الرفع أو SQLite للتجربة المحلية)
-const dbUrl = process.env.DATABASE_URL || 'sqlite:planner.sqlite';
+// --- إعداد قاعدة البيانات ---
+// الرابط سيتم سحبه من Environment Variables في Vercel
+const dbUrl = process.env.DATABASE_URL; 
+
 const sequelize = new Sequelize(dbUrl, {
+    dialect: 'postgres',
     logging: false,
-    dialectOptions: dbUrl.includes('postgres') ? {
-        ssl: { require: true, rejectUnauthorized: false }
-    } : {}
+    dialectOptions: {
+        ssl: {
+            require: true,
+            rejectUnauthorized: false // ضروري للاتصال بـ Supabase من Vercel
+        }
+    }
 });
 
 // --- تعريف الجداول (Models) ---
@@ -38,21 +44,21 @@ const Note = sequelize.define('Note', {
     UserId: DataTypes.INTEGER
 });
 
-// مزامنة قاعدة البيانات
+// مزامنة الجداول مع قاعدة البيانات
 sequelize.sync();
 
 // --- الإعدادات (Middleware) ---
 app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
+app.set('views', path.join(__dirname, 'views')); // ضمان قراءة المجلد في Vercel
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(session({
-    secret: 'my-super-secret-key-2026',
+    secret: 'planner_secret_2026',
     resave: false,
     saveUninitialized: false
 }));
 
-// دالة حماية الصفحات (تأكد أن المستخدم مسجل دخول)
+// دالة حماية المسارات (لابد من تسجيل الدخول)
 function auth(req, res, next) {
     if (!req.session.userId) return res.redirect('/login');
     next();
@@ -60,7 +66,7 @@ function auth(req, res, next) {
 
 const monthsNames = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"];
 
-// --- مسارات الحسابات (Auth Routes) ---
+// --- المسارات (Routes) ---
 
 app.get('/login', (req, res) => res.render('login', { error: null }));
 app.get('/register', (req, res) => res.render('register', { error: null }));
@@ -70,7 +76,7 @@ app.post('/register', async (req, res) => {
         const user = await User.create(req.body);
         req.session.userId = user.id;
         res.redirect('/');
-    } catch (e) { res.render('register', { error: "اسم المستخدم موجود مسبقاً" }); }
+    } catch (e) { res.render('register', { error: "الاسم موجود بالفعل" }); }
 });
 
 app.post('/login', async (req, res) => {
@@ -78,7 +84,7 @@ app.post('/login', async (req, res) => {
     if (user) {
         req.session.userId = user.id;
         res.redirect('/');
-    } else { res.render('login', { error: "بيانات الدخول غير صحيحة" }); }
+    } else { res.render('login', { error: "بيانات خاطئة" }); }
 });
 
 app.get('/logout', (req, res) => {
@@ -86,15 +92,12 @@ app.get('/logout', (req, res) => {
     res.redirect('/login');
 });
 
-// --- مسارات المشروع (Main Routes) ---
-
-// الصفحة الرئيسية (الشهور)
+// الصفحة الرئيسية - حل مشكلة note is not defined
 app.get('/', auth, async (req, res) => {
     const note = await Note.findOne({ where: { category: 'main', UserId: req.session.userId } });
     res.render('months', { monthsNames, note: note ? note.content : "" });
 });
 
-// صفحة الأسابيع
 app.get('/month/:mId', auth, async (req, res) => {
     const mId = parseInt(req.params.mId);
     let weeksStats = [];
@@ -107,11 +110,11 @@ app.get('/month/:mId', auth, async (req, res) => {
     res.render('weeks', { mId, mName: monthsNames[mId], weeksStats, note: note ? note.content : "" });
 });
 
-// صفحة المهام اليومية
 app.get('/month/:mId/week/:wId', auth, async (req, res) => {
     const { mId, wId } = req.params;
     const daysNames = ['الأحد', 'الاثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة', 'السبت'];
     const tasks = await Task.findAll({ where: { month: mId, weekInMonth: wId, UserId: req.session.userId } });
+    const note = await Note.findOne({ where: { category: 'week', monthId: mId, weekId: wId, UserId: req.session.userId } });
     
     let startDayOffset = (parseInt(wId) - 1) * 7;
     let daysWithDates = daysNames.map((name, index) => {
@@ -119,40 +122,33 @@ app.get('/month/:mId/week/:wId', auth, async (req, res) => {
         return { name, dateStr: `${date.getDate()}/${date.getMonth() + 1}` };
     });
 
-    const note = await Note.findOne({ where: { category: 'week', monthId: mId, weekId: wId, UserId: req.session.userId } });
     res.render('tasks', { mId, wId, mName: monthsNames[mId], daysWithDates, tasks, note: note ? note.content : "" });
 });
 
-// حفظ الملاحظات
 app.post('/save-note', auth, async (req, res) => {
     const { content, category, monthId, weekId } = req.body;
-    let whereClause = { category, UserId: req.session.userId };
-    if (monthId && monthId != -1) whereClause.monthId = monthId;
-    if (weekId && weekId != -1) whereClause.weekId = weekId;
+    let where = { category, UserId: req.session.userId };
+    if (monthId && monthId != -1) where.monthId = monthId;
+    if (weekId && weekId != -1) where.weekId = weekId;
 
-    const [note, created] = await Note.findOrCreate({ 
-        where: whereClause, 
-        defaults: { content, UserId: req.session.userId } 
-    });
+    const [note, created] = await Note.findOrCreate({ where, defaults: { content, UserId: req.session.userId } });
     if (!created) { note.content = content; await note.save(); }
     res.redirect('back');
 });
 
-// إضافة مهمة
 app.post('/add', auth, async (req, res) => {
     await Task.create({ ...req.body, UserId: req.session.userId });
     res.redirect('back');
 });
 
-// تحديث حالة المهمة
 app.post('/toggle/:id', auth, async (req, res) => {
     const task = await Task.findOne({ where: { id: req.params.id, UserId: req.session.userId } });
     if (task) { task.completed = !task.completed; await task.save(); }
     res.redirect('back');
 });
 
-// --- تشغيل السيرفر (متوافق مع Vercel) ---
+// --- تشغيل السيرفر ---
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-module.exports = app; // مهم جداً للرفع على Vercel
+module.exports = app; // ضروري جداً لعمل المشروع على Vercel
